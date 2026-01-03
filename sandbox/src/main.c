@@ -1,6 +1,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_mutex.h>
-#include <SDL3/SDL_thread.h>
+#include <SDL3/SDL_render.h>
+#include <SDL3/SDL_timer.h>
 #include <time.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -8,6 +9,7 @@
 #define HANDLE_SDL_CALL(x) do {if(!x) {SDL_Log("Failed " #x " on line %d", __LINE__); done = true; return -1;}} while(0)
 SDL_Window *window;
 SDL_Renderer *renderer;
+
 bool done = false;
 
 // PSEUDORANDOM
@@ -26,39 +28,75 @@ int pmrand(){
 #define GRAIN_SPEED 20 //ms
 #define GRAIN_H 5 //pixels
 
+#define GRID_SIZE 512
+
 typedef struct grain {
   SDL_FRect pixel;
   SDL_Mutex *mtx;
+  bool update;
 } grain;
 
+const int num_grains = (GRID_SIZE * GRID_SIZE)/(GRAIN_H*GRAIN_H);
+grain *grains;
+
+int *col_heights; // len = num_grains/GRAIN_H
+
+int spawn_ptr = 1;
+
 void init_grain(grain *grain){
-  grain->pixel.x = 256;
+  grain->pixel.x = GRID_SIZE/2;
   grain->pixel.y = 0;
   grain->pixel.w = GRAIN_H;
   grain->pixel.h = GRAIN_H;
   grain->mtx = SDL_CreateMutex();
+  grain->update = true;
 }
 
 void update_grain(grain *grain){
-  grain->pixel.y += 1;
-  grain->pixel.x += abs(pmrand()) % 3 - 1;
-}
+  // Check surrounding pixels on screen state
+  int rand_dir = abs(pmrand()) % 3 - 1;
+  int column = grain->pixel.x / 5;
 
-const int num_grains = 512*512/(GRAIN_H*GRAIN_H);
-grain *grains;
-int spawn_ptr = 1;
+  if(grain->pixel.y < GRID_SIZE - col_heights[column] - 1) {
+    int new_column = (grain->pixel.x + rand_dir) / 5;
+    if (grain->pixel.y + 1 < GRID_SIZE - col_heights[new_column] - 1){
+      grain->pixel.x += rand_dir; 
+    }
+    grain->pixel.y += 1;
+  } else {
+    col_heights[column]++;
+    grain->update = false;
+  }
+}
 
 int update_state(void *data){
   while (!done){
     for(int i=0; i<spawn_ptr; i++){
       SDL_LockMutex(grains[i].mtx);
-      update_grain(&grains[i]);
+      if(grains[i].update) update_grain(&grains[i]);
       SDL_UnlockMutex(grains[i].mtx);
     }
 
     if(spawn_ptr < num_grains) spawn_ptr++;
 
     SDL_Delay(GRAIN_SPEED);
+  }
+
+  return 0;
+}
+
+SDL_Mutex *frame_counter_mtx;
+int frame_counter = 0;
+float fps = 0;
+
+int update_debug(void *data){
+  while (!done){
+    SDL_Delay(500);
+    fps = frame_counter / 0.5;
+
+    SDL_LockMutex(frame_counter_mtx);
+    frame_counter = 0;
+    SDL_UnlockMutex(frame_counter_mtx);
   }
 
   return 0;
@@ -72,20 +110,34 @@ int main(int argc, char **argv){
 
   HANDLE_SDL_CALL(SDL_Init(SDL_INIT_VIDEO));
 
-  window = SDL_CreateWindow("SDL3 Test", 512, 512, SDL_WINDOW_BORDERLESS);
+  window = SDL_CreateWindow("SDL3 Test", GRID_SIZE, GRID_SIZE, SDL_WINDOW_BORDERLESS);
   renderer = SDL_CreateRenderer(window, NULL);
 
-  HANDLE_SDL_CALL(SDL_SetWindowSize(window, 512, 512));
+  HANDLE_SDL_CALL(SDL_SetWindowSize(window, GRID_SIZE, GRID_SIZE));
 
   grains = calloc(num_grains, sizeof(grain));
   for(int i=0; i<num_grains; i++){
     init_grain(&grains[i]);
   }
 
+#ifdef DEBUG
+  frame_counter_mtx = SDL_CreateMutex();
+#endif
+
+  col_heights = calloc(num_grains/GRAIN_H, sizeof(int));
+  for(int i=0; i<num_grains/GRAIN_H; i++){
+    col_heights[i] = 0;
+  }
+
+#ifdef DEBUG
+  SDL_Thread *debug_thread = SDL_CreateThread(update_debug, "update debug", NULL);
+#endif
   SDL_Thread *state_thread = SDL_CreateThread(update_state, "update state", NULL);
+
   SDL_Event e;
 
   while (!done){
+    uint64_t time_a = SDL_GetTicks();
     while(SDL_PollEvent(&e)){
       if (e.type == SDL_EVENT_KEY_DOWN && 
           e.key.key == SDLK_ESCAPE) {
@@ -106,14 +158,32 @@ int main(int argc, char **argv){
       SDL_UnlockMutex(grains[i].mtx);
     }
 
+#ifdef DEBUG
+    HANDLE_SDL_CALL(SDL_RenderDebugTextFormat(renderer, 5.0, 5.0, "%.2f", fps));
+#endif
+
     HANDLE_SDL_CALL(SDL_RenderPresent(renderer));
+
+#ifdef DEBUG
+    SDL_LockMutex(frame_counter_mtx);
+    frame_counter++;
+    SDL_UnlockMutex(frame_counter_mtx);
+#endif
+
+    uint64_t time_b = SDL_GetTicks();
+    SDL_Delay(17 - (time_b - time_a)); // cap to 60fps
   }
 
   SDL_WaitThread(state_thread, NULL);
 
+#ifdef DEBUG
+  SDL_WaitThread(debug_thread, NULL);
+#endif
+
   for(int i=0; i<num_grains; i++){
     SDL_DestroyMutex(grains[i].mtx);
   }
+
   free(grains);
 
   SDL_DestroyRenderer(renderer);
